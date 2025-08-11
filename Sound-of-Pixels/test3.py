@@ -2,6 +2,7 @@
 import os
 import random
 import time
+import datetime
 import warnings
 import sys
 
@@ -67,7 +68,8 @@ class NetWrapper(torch.nn.Module):
             else:
                 gt_masks[n] = mags[n] / mag_mix
                 # clamp to avoid large numbers in ratio masks
-                gt_masks[n].clamp_(0., 5.)
+                gt_masks[n].clamp_(0., 1.)
+            
 
 
         # LOG magnitude
@@ -384,7 +386,7 @@ def evaluate(netWrapper, loader, history, epoch, args):
 
 
 # train one epoch
-def train(netWrapper, loader, optimizer, history, epoch, args):
+def train(netWrapper, loader, optimizer, history, epoch, args, nets):
     torch.set_grad_enabled(True)
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -409,7 +411,7 @@ def train(netWrapper, loader, optimizer, history, epoch, args):
 
         # backward
         err.backward()
-        for name, param in model.named_parameters():
+        for name, param in netWrapper.named_parameters():
             if param.requires_grad and param.grad is None:
                 print("No grad for:", name)
 
@@ -439,6 +441,9 @@ def train(netWrapper, loader, optimizer, history, epoch, args):
                 
         optimizer.step()
         steps += 1
+        # save checkpoint every 100 steps
+        if (i + 1) % 100 == 0:
+            checkpoint(nets, history, epoch, args)
         # measure total time
         torch.cuda.synchronize()
         batch_time.update(time.perf_counter() - tic)
@@ -462,8 +467,9 @@ def train(netWrapper, loader, optimizer, history, epoch, args):
 def checkpoint(nets, history, epoch, args):
     print('Saving checkpoints at {} epochs.'.format(epoch))
     (net_frame, net_sound) = nets
-    suffix_latest = 'latest.pth'
-    suffix_best = 'best.pth'
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix_latest = f'latest_{timestamp}.pth'
+    suffix_best = f'best_{timestamp}.pth'
 
     torch.save(history,
                '{}/history_{}'.format(args.ckpt, suffix_latest))
@@ -549,7 +555,7 @@ def main(args):
 
     # Training loop
     for epoch in range(1, args.num_epoch + 1):
-        train(netWrapper, loader_train, optimizer, history, epoch, args)
+        train(netWrapper, loader_train, optimizer, history, epoch, args, nets)
 
         # Evaluation and visualization
         if epoch % args.eval_epoch == 0:
