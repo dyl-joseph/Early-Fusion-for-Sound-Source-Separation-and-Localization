@@ -2,6 +2,9 @@
 import os
 import random
 import time
+import datetime
+import warnings
+import sys
 
 # Numerical libs
 import torch
@@ -18,21 +21,21 @@ from models import ModelBuilder, activate
 from utils import AverageMeter, \
     recover_rgb, magnitude2heatmap,\
     istft_reconstruction, warpgrid, \
-    combine_video_audio, save_video, makedirs, save_wav
+    combine_video_audio, save_video, makedirs
 from viz import plot_loss_metrics, HTMLVisualizer
 
 
-# Network wrapper, defines forward pass
 class NetWrapper(torch.nn.Module):
     def __init__(self, nets, crit):
         super(NetWrapper, self).__init__()
-        self.net_sound, self.net_frame, self.net_synthesizer = nets
+        self.net_frame, self.net_sound = nets
         self.crit = crit
-
+    
     def forward(self, batch_data, args):
         mag_mix = batch_data['mag_mix']
         mags = batch_data['mags']
         frames = batch_data['frames']
+        
         mag_mix = mag_mix + 1e-10
 
         N = args.num_mix
@@ -40,9 +43,11 @@ class NetWrapper(torch.nn.Module):
         T = mag_mix.size(3)
 
         # 0.0 warp the spectrogram
+        mag_mix = mag_mix.to(args.device)
+        mags = [m.to(args.device) for m in mags]
         if args.log_freq:
             grid_warp = torch.from_numpy(
-                warpgrid(B, 256, T, warp=True)).to(args.device)
+            warpgrid(B, 256, T, warp=True)).to(args.device)
             mag_mix = F.grid_sample(mag_mix, grid_warp)
             for n in range(N):
                 mags[n] = F.grid_sample(mags[n], grid_warp)
@@ -63,33 +68,41 @@ class NetWrapper(torch.nn.Module):
             else:
                 gt_masks[n] = mags[n] / mag_mix
                 # clamp to avoid large numbers in ratio masks
-                gt_masks[n].clamp_(0., 5.)
+                gt_masks[n].clamp_(0., 1.)
+            
+
 
         # LOG magnitude
+        
         log_mag_mix = torch.log(mag_mix).detach()
+        dataset_mean = -1.4647 
+        dataset_std = 2.6562 
+        log_mag_mix = (log_mag_mix - dataset_mean) / dataset_std
 
-        # 1. forward net_sound -> BxCxHxW
-        feat_sound = self.net_sound(log_mag_mix)
-        feat_sound = activate(feat_sound, args.sound_activation)
-
-        # 2. forward net_frame -> Bx1xC
-        feat_frames = [None for n in range(N)]
+        # 1. Forward net_visual
+        frames = frames.to(args.device)
+        
+        feat_frames = []
         for n in range(N):
-            feat_frames[n] = self.net_frame.forward_multiframe(frames[n])
-            feat_frames[n] = activate(feat_frames[n], args.img_activation)
+            # Slices the batch for the n-th source, shape: (batch_size, C, T, H, W)
+            frames_of_source_n = frames[:, n]
+            feat_frames.append(self.net_frame.forward(frames_of_source_n))
 
-        # 3. sound synthesizer
+        # 2. Forward net_audio
+
         pred_masks = [None for n in range(N)]
         for n in range(N):
-            pred_masks[n] = self.net_synthesizer(feat_frames[n], feat_sound)
-            pred_masks[n] = activate(pred_masks[n], args.output_activation)
-
-        # 4. loss
-        err = self.crit(pred_masks, gt_masks, weight).reshape(1)
-
+            pred_masks[n] = self.net_sound(log_mag_mix, feat_frames[n])
+        # print(f'length of pred_masks: {len(pred_masks)}')
+        
+        # 3. Loss
+        # print(f'length of gt_masks: {len(gt_masks)}')
+        err = self.crit(pred_masks, gt_masks, weight)
+        # err = self.crit(pred_masks, gt_masks, weight)reshape(1)
+        
         return err, \
-            {'pred_masks': pred_masks, 'gt_masks': gt_masks,
-             'mag_mix': mag_mix, 'mags': mags, 'weight': weight}
+        {'pred_masks': pred_masks, 'gt_masks': gt_masks,
+            'mag_mix': mag_mix, 'mags': mags, 'weight': weight}
 
 
 # Calculate metrics
@@ -110,6 +123,7 @@ def calc_metrics(batch_data, outputs, args):
     # unwarp log scale
     N = args.num_mix
     B = mag_mix.size(0)
+    # print(B)
     pred_masks_linear = [None for n in range(N)]
     for n in range(N):
         if args.log_freq:
@@ -162,6 +176,7 @@ def calc_metrics(batch_data, outputs, args):
             sdr_meter.update(sdr.mean())
             sir_meter.update(sir.mean())
             sar_meter.update(sar.mean())
+        
 
     return [sdr_mix_meter.average(),
             sdr_meter.average(),
@@ -177,22 +192,17 @@ def output_visuals(vis_rows, batch_data, outputs, args):
     frames = batch_data['frames']
     infos = batch_data['infos']
 
-    print("[DEBUG] Batch infos:", infos)
-    print(f"[DEBUG] mag_mix shape: {mag_mix.shape}, phase_mix shape: {phase_mix.shape}")
-    print(f"[DEBUG] frames shape: {[f.shape for f in frames]}")
-
     pred_masks_ = outputs['pred_masks']
     gt_masks_ = outputs['gt_masks']
     mag_mix_ = outputs['mag_mix']
     weight_ = outputs['weight']
 
-    print(f"[DEBUG] pred_masks shapes: {[p.shape for p in pred_masks_]}")
-    print(f"[DEBUG] gt_masks shapes: {[g.shape for g in gt_masks_]}")
-    print(f"[DEBUG] mag_mix_ shape: {mag_mix_.shape}, weight_ shape: {weight_.shape}")
-
     # unwarp log scale
     N = args.num_mix
     B = mag_mix.size(0)
+    # print(N)
+    # print(B)
+    # print(len(frames))
     pred_masks_linear = [None for n in range(N)]
     gt_masks_linear = [None for n in range(N)]
     for n in range(N):
@@ -232,10 +242,6 @@ def output_visuals(vis_rows, batch_data, outputs, args):
         prefix = '+'.join(prefix)
         makedirs(os.path.join(args.vis, prefix))
 
-        print(f"[DEBUG] Saving outputs for sample {j}, prefix: {prefix}")
-        print(f"[DEBUG] mag_mix[j, 0] min/max: {mag_mix[j, 0].min()}/{mag_mix[j, 0].max()}")
-        print(f"[DEBUG] phase_mix[j, 0] min/max: {phase_mix[j, 0].min()}/{phase_mix[j, 0].max()}")
-
         # save mixture
         mix_wav = istft_reconstruction(mag_mix[j, 0], phase_mix[j, 0], hop_length=args.stft_hop)
         mix_amp = magnitude2heatmap(mag_mix_[j, 0])
@@ -245,7 +251,7 @@ def output_visuals(vis_rows, batch_data, outputs, args):
         filename_weight = os.path.join(prefix, 'weight.jpg')
         imwrite(os.path.join(args.vis, filename_mixmag), mix_amp[::-1, :, :])
         imwrite(os.path.join(args.vis, filename_weight), weight[::-1, :])
-        save_wav(os.path.join(args.vis, filename_mixwav), mix_wav, args.audRate)
+        wavfile.write(os.path.join(args.vis, filename_mixwav), args.audRate, mix_wav)
         row_elements += [{'text': prefix}, {'image': filename_mixmag, 'audio': filename_mixwav}]
 
         # save each component
@@ -257,42 +263,37 @@ def output_visuals(vis_rows, batch_data, outputs, args):
             pred_mag = mag_mix[j, 0] * pred_masks_linear[n][j, 0]
             preds_wav[n] = istft_reconstruction(pred_mag, phase_mix[j, 0], hop_length=args.stft_hop)
 
-            print(f"[DEBUG] gt_mag min/max: {gt_mag.min()}/{gt_mag.max()} for n={n}")
-            print(f"[DEBUG] pred_mag min/max: {pred_mag.min()}/{pred_mag.max()} for n={n}")
-            print(f"[DEBUG] gt_wav min/max: {gt_wav.min()}/{gt_wav.max()} for n={n}")
-            print(f"[DEBUG] preds_wav[n] min/max: {preds_wav[n].min()}/{preds_wav[n].max()} for n={n}")
-
             # output masks
             filename_gtmask = os.path.join(prefix, 'gtmask{}.jpg'.format(n+1))
             filename_predmask = os.path.join(prefix, 'predmask{}.jpg'.format(n+1))
             gt_mask = (np.clip(gt_masks_[n][j, 0], 0, 1) * 255).astype(np.uint8)
             pred_mask = (np.clip(pred_masks_[n][j, 0], 0, 1) * 255).astype(np.uint8)
-            print(f"[DEBUG] gt_mask unique values: {np.unique(gt_mask)} for n={n}")
-            print(f"[DEBUG] pred_mask unique values: {np.unique(pred_mask)} for n={n}")
             imwrite(os.path.join(args.vis, filename_gtmask), gt_mask[::-1, :])
             imwrite(os.path.join(args.vis, filename_predmask), pred_mask[::-1, :])
 
             # ouput spectrogram (log of magnitude, show colormap)
             filename_gtmag = os.path.join(prefix, 'gtamp{}.jpg'.format(n+1))
             filename_predmag = os.path.join(prefix, 'predamp{}.jpg'.format(n+1))
-            gt_mag_img = magnitude2heatmap(gt_mag)
-            pred_mag_img = magnitude2heatmap(pred_mag)
-            imwrite(os.path.join(args.vis, filename_gtmag), gt_mag_img[::-1, :, :])
-            imwrite(os.path.join(args.vis, filename_predmag), pred_mag_img[::-1, :, :])
+            gt_mag = magnitude2heatmap(gt_mag)
+            pred_mag = magnitude2heatmap(pred_mag)
+            imwrite(os.path.join(args.vis, filename_gtmag), gt_mag[::-1, :, :])
+            imwrite(os.path.join(args.vis, filename_predmag), pred_mag[::-1, :, :])
 
             # output audio
             filename_gtwav = os.path.join(prefix, 'gt{}.wav'.format(n+1))
             filename_predwav = os.path.join(prefix, 'pred{}.wav'.format(n+1))
-            save_wav(os.path.join(args.vis, filename_gtwav), gt_wav, args.audRate)
-            save_wav(os.path.join(args.vis, filename_predwav), preds_wav[n], args.audRate)
+            wavfile.write(os.path.join(args.vis, filename_gtwav), args.audRate, gt_wav)
+            wavfile.write(os.path.join(args.vis, filename_predwav), args.audRate, preds_wav[n])
 
             # output video
-        
-            frames_tensor = [recover_rgb(frames[n][j, :, t]) for t in range(args.num_frames)]
+            
+            frames_tensor = [recover_rgb(frames[j][n, :, t]) for t in range(args.num_frames)]
             frames_tensor = np.asarray(frames_tensor)
             path_video = os.path.join(args.vis, prefix, 'video{}.mp4'.format(n+1))
             save_video(path_video, frames_tensor, fps=args.frameRate/args.stride_frames)
 
+            
+            
             # combine gt video and audio
             filename_av = os.path.join(prefix, 'av{}.mp4'.format(n+1))
             combine_video_audio(
@@ -306,6 +307,7 @@ def output_visuals(vis_rows, batch_data, outputs, args):
                 {'image': filename_gtmag, 'audio': filename_gtwav},
                 {'image': filename_predmask},
                 {'image': filename_gtmask}]
+        # print(f"GT Mask {0} for sample {j} Mean: {gt_masks_linear[n][j, 0].mean().item()}")
 
         row_elements += [{'image': filename_weight}]
         vis_rows.append(row_elements)
@@ -384,12 +386,14 @@ def evaluate(netWrapper, loader, history, epoch, args):
 
 
 # train one epoch
-def train(netWrapper, loader, optimizer, history, epoch, args):
+def train(netWrapper, loader, optimizer, history, epoch, args, nets):
     torch.set_grad_enabled(True)
     batch_time = AverageMeter()
     data_time = AverageMeter()
     # switch to train mode
     netWrapper.train()
+
+    steps = 0
 
     # main loop
     torch.cuda.synchronize()
@@ -400,14 +404,46 @@ def train(netWrapper, loader, optimizer, history, epoch, args):
         data_time.update(time.perf_counter() - tic)
 
         # forward pass
-        netWrapper.zero_grad()
+        optimizer.zero_grad()
+        
         err, _ = netWrapper.forward(batch_data, args)
         err = err.mean()
 
         # backward
         err.backward()
-        optimizer.step()
+        for name, param in netWrapper.named_parameters():
+            if param.requires_grad and param.grad is None:
+                print("No grad for:", name)
 
+
+#        print("--- Checking UNet Gradients ---")
+#        for name, param in netWrapper.module.net_sound.named_parameters():
+#           if param.grad is not None:
+#               # Check for very small gradients
+#               if param.grad.abs().mean() < 1e-8 and 'bias' not in name: # Example threshold
+#                   print(f"  UNet param {name}: Gradient Mean (Abs): {param.grad.abs().mean().item()} (VERY SMALL)")
+#               # Check for NaN/Inf gradients
+#               if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+#                   print(f"  UNet param {name}: Gradient contains NaN/Inf!")
+#           else:
+#               print(f"  UNet param {name}: No gradient (requires_grad={param.requires_grad})")
+#
+#        print("--- Checking Resnet Gradients (proj layer) ---")
+#        for name, param in netWrapper.module.net_frame.model.blocks[5].proj.named_parameters():
+#           if param.grad is not None:
+#               if param.grad.abs().mean() < 1e-8 and 'bias' not in name:
+#                   print(f"  Resnet proj param {name}: Gradient Mean (Abs): {param.grad.abs().mean().item()} (VERY SMALL)")
+#               if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+#                   print(f"  Resnet proj param {name}: Gradient contains NaN/Inf!")
+#           else:
+#               print(f"  Resnet proj param {name}: No gradient (requires_grad={param.requires_grad})")
+#
+                
+        optimizer.step()
+        steps += 1
+        # save checkpoint every 100 steps
+        if (i + 1) % 100 == 0:
+            checkpoint(nets, history, epoch, args)
         # measure total time
         torch.cuda.synchronize()
         batch_time.update(time.perf_counter() - tic)
@@ -416,22 +452,24 @@ def train(netWrapper, loader, optimizer, history, epoch, args):
         # display
         if i % args.disp_iter == 0:
             print('Epoch: [{}][{}/{}], Time: {:.2f}, Data: {:.2f}, '
-                  'lr_sound: {}, lr_frame: {}, lr_synthesizer: {}, '
+                  'lr_frame: {}, lr_sound: {}, '
                   'loss: {:.4f}'
                   .format(epoch, i, args.epoch_iters,
                           batch_time.average(), data_time.average(),
-                          args.lr_sound, args.lr_frame, args.lr_synthesizer,
+                          args.lr_sound, args.lr_frame,
                           err.item()))
             fractional_epoch = epoch - 1 + 1. * i / args.epoch_iters
             history['train']['epoch'].append(fractional_epoch)
             history['train']['err'].append(err.item())
-
+        if (steps == 1000):
+            sys.exit()
 
 def checkpoint(nets, history, epoch, args):
     print('Saving checkpoints at {} epochs.'.format(epoch))
-    (net_sound, net_frame, net_synthesizer) = nets
-    suffix_latest = 'latest.pth'
-    suffix_best = 'best.pth'
+    (net_frame, net_sound) = nets
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix_latest = f'latest_{timestamp}.pth'
+    suffix_best = f'best_{timestamp}.pth'
 
     torch.save(history,
                '{}/history_{}'.format(args.ckpt, suffix_latest))
@@ -439,8 +477,8 @@ def checkpoint(nets, history, epoch, args):
                '{}/sound_{}'.format(args.ckpt, suffix_latest))
     torch.save(net_frame.state_dict(),
                '{}/frame_{}'.format(args.ckpt, suffix_latest))
-    torch.save(net_synthesizer.state_dict(),
-               '{}/synthesizer_{}'.format(args.ckpt, suffix_latest))
+    # torch.save(net_synthesizer.state_dict(),
+    #            '{}/synthesizer_{}'.format(args.ckpt, suffix_latest))
 
     cur_err = history['val']['err'][-1]
     if cur_err < args.best_err:
@@ -449,23 +487,21 @@ def checkpoint(nets, history, epoch, args):
                    '{}/sound_{}'.format(args.ckpt, suffix_best))
         torch.save(net_frame.state_dict(),
                    '{}/frame_{}'.format(args.ckpt, suffix_best))
-        torch.save(net_synthesizer.state_dict(),
-                   '{}/synthesizer_{}'.format(args.ckpt, suffix_best))
+        # torch.save(net_synthesizer.state_dict(),
+        #            '{}/synthesizer_{}'.format(args.ckpt, suffix_best))
 
 
 def create_optimizer(nets, args):
-    (net_sound, net_frame, net_synthesizer) = nets
-    param_groups = [{'params': net_sound.parameters(), 'lr': args.lr_sound},
-                    {'params': net_synthesizer.parameters(), 'lr': args.lr_synthesizer},
-                    {'params': net_frame.features.parameters(), 'lr': args.lr_frame},
-                    {'params': net_frame.fc.parameters(), 'lr': args.lr_sound}]
-    return torch.optim.SGD(param_groups, momentum=args.beta1, weight_decay=args.weight_decay)
+    (net_frame, net_sound) = nets
+    param_groups = [{'params': net_frame.model.blocks[5].proj.parameters(), 'lr': args.lr_frame},
+                    {'params': net_sound.parameters(), 'lr': args.lr_sound}]
+    return torch.optim.Adam(param_groups, weight_decay=args.weight_decay)
 
 
 def adjust_learning_rate(optimizer, args):
     args.lr_sound *= 0.1
     args.lr_frame *= 0.1
-    args.lr_synthesizer *= 0.1
+    # args.lr_synthesizer *= 0.1
     for param_group in optimizer.param_groups:
         param_group['lr'] *= 0.1
 
@@ -473,20 +509,9 @@ def adjust_learning_rate(optimizer, args):
 def main(args):
     # Network Builders
     builder = ModelBuilder()
-    net_sound = builder.build_sound(
-        arch=args.arch_sound,
-        fc_dim=args.num_channels,
-        weights=args.weights_sound)
-    net_frame = builder.build_frame(
-        arch=args.arch_frame,
-        fc_dim=args.num_channels,
-        pool_type=args.img_pool,
-        weights=args.weights_frame)
-    net_synthesizer = builder.build_synthesizer(
-        arch=args.arch_synthesizer,
-        fc_dim=args.num_channels,
-        weights=args.weights_synthesizer)
-    nets = (net_sound, net_frame, net_synthesizer)
+    net_frame = builder.build_visual()
+    net_sound = builder.build_unet(unet_num_layers=5)
+    nets = (net_frame, net_sound)
     crit = builder.build_criterion(arch=args.loss)
 
     # Dataset and Loader
@@ -507,8 +532,8 @@ def main(args):
         shuffle=False,
         num_workers=2,
         drop_last=False)
-    # args.epoch_iters = len(dataset_train) // args.batch_size
-    # print('1 Epoch = {} iters'.format(args.epoch_iters))
+    args.epoch_iters = len(dataset_train) // args.batch_size
+    print('1 Epoch = {} iters'.format(args.epoch_iters))
 
     # Wrap networks
     netWrapper = NetWrapper(nets, crit)
@@ -517,8 +542,7 @@ def main(args):
 
     # Set up optimizer
     optimizer = create_optimizer(nets, args)
-
-    # History of peroformance
+    # History of performance
     history = {
         'train': {'epoch': [], 'err': []},
         'val': {'epoch': [], 'err': [], 'sdr': [], 'sir': [], 'sar': []}}
@@ -531,7 +555,7 @@ def main(args):
 
     # Training loop
     for epoch in range(1, args.num_epoch + 1):
-        train(netWrapper, loader_train, optimizer, history, epoch, args)
+        train(netWrapper, loader_train, optimizer, history, epoch, args, nets)
 
         # Evaluation and visualization
         if epoch % args.eval_epoch == 0:
@@ -548,12 +572,15 @@ def main(args):
 
 
 if __name__ == '__main__':
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
     # arguments
     parser = ArgParser()
     args = parser.parse_train_arguments()
     args.batch_size = args.num_gpus * args.batch_size_per_gpu
     args.device = torch.device("cuda")
+    args.mode = 'train'
 
+    print(args.mode)
     # experiment name
     if args.mode == 'train':
         args.id += '-{}mix'.format(args.num_mix)
