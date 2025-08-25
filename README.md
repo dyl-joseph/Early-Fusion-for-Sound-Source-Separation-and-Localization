@@ -10,5 +10,7 @@ Using the early fusion method from _Co-Separating Sounds of Visual Objects_, I s
 ## Acccessing the model + outputs
 Model weights and outputs uploaded onto [Google Drive](https://drive.google.com/drive/folders/1sUyiPq8j1qdRlS6P5MbO5j8_XlpGmrYR?usp=sharing).
 
-## Cite
-Hang Zhao, Chuang Gan, Andrew Rouditchenko, Carl Vondrick, Josh McDermott, and Antonio Torralba, “The Sound of Pixels,” in The European Conference on Computer Vision (ECCV), September 2018.
+## Papers referenced and Code Used
+Hang Zhao, Chuang Gan, Andrew Rouditchenko, Carl Vondrick, Josh McDermott, and Antonio Torralba, “The Sound of Pixels,” in The European Conference on Computer Vision (ECCV), September 2018. ([Code](https://github.com/hangzhaomit/Sound-of-Pixels))
+
+R. Gao and K. Grauman, “Co-separating sounds of visual objects,” in International Conference on Computer Vision (ICCV), 2019. ([Code](https://github.com/rhgao/co-separation))
